@@ -82,6 +82,10 @@ class Cell(QPushButton):
             p.fillRect(self.width()-1, 0, 1, self.height(), edge)
         else:
             bevel(p, self.rect(), self.isDown())
+        if self.property("hint"):
+            p.setPen(QPen(QColor("#008000"), 3))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(self.rect().adjusted(2, 2, -3, -3))
         # Draw icons geometrically so the classic symbols do not depend on fonts.
         p.translate(self.width()/2, self.height()/2)
         if state in {"flag", "won"}:
@@ -175,6 +179,14 @@ class Minesweeper(QMainWindow):
         game_menu.addSeparator()
         self.flag_mode = game_menu.addAction("左键插旗模式")
         self.flag_mode.setCheckable(True)
+        self.auto_flag_action = game_menu.addAction("自动标雷(&M)")
+        self.auto_flag_action.setCheckable(True)
+        self.auto_flag_action.setShortcut(QKeySequence("Ctrl+M"))
+        self.auto_flag_action.setToolTip("勾选后，每次翻开格子自动标记确定的地雷")
+        self.auto_flag_action.toggled.connect(self.auto_flag_toggled)
+        hint_action = game_menu.addAction("安全提示(&H)")
+        hint_action.setShortcut(QKeySequence("Ctrl+H"))
+        hint_action.triggered.connect(self.show_safe_hint)
         game_menu.addAction("最佳成绩", self.show_records)
         game_menu.addSeparator()
         game_menu.addAction("退出", self.close)
@@ -241,6 +253,9 @@ class Minesweeper(QMainWindow):
         self.flag_mode.setChecked(False)
         self.set_face("ready")
         self.game = Game(*self.LEVELS[self.level.currentText()])
+        self.generating = False
+        self.unsetCursor()
+        self.hint_pos = None
         container = QWidget()
         container.setObjectName("board")
         outer = QVBoxLayout(container)
@@ -332,6 +347,8 @@ class Minesweeper(QMainWindow):
         button.update()
 
     def toggle_flag(self, pos):
+        if self.generating:
+            return
         if self.game.toggle_flag(pos):
             flagged = pos in self.game.flags
             self.paint_cell(pos, "flag" if flagged else "closed", "旗" if flagged else "")
@@ -339,11 +356,55 @@ class Minesweeper(QMainWindow):
         elif not self.game.finished and pos not in self.game.opened:
             self.status.setText("旗子已用完 · 请先取消一个标记")
 
+    def auto_flag_toggled(self, enabled):
+        self.auto_flag_action.setToolTip("勾选后，每次翻开格子自动标记确定的地雷")
+        if not self.game.finished:
+            self.status.setText("自动标雷已开启" if enabled else "自动标雷已关闭")
+
+    def auto_flag(self):
+        if not self.game.started or self.game.finished:
+            return
+        added = self.game.auto_flag()
+        for pos in added:
+            self.paint_cell(pos, "flag", "旗")
+        self.update_info()
+        if added:
+            self.status.setText(f"已自动标雷 {len(added)} 格")
+        self.status.setToolTip("使用数字、集合差和剩余雷数推理，不信任手动旗子。卡住时按 Ctrl+H 查看可证明安全的格子。")
+
+    def clear_hint(self):
+        if self.hint_pos is not None:
+            self.buttons[self.hint_pos].setProperty("hint", False)
+            self.buttons[self.hint_pos].update()
+            self.hint_pos = None
+
+    def show_safe_hint(self):
+        self.clear_hint()
+        if self.generating or not self.game.started or self.game.finished:
+            return
+        safe, _ = self.game.logical_moves()
+        if not safe:
+            self.status.setText("未找到可证明的安全格")
+            return
+        self.hint_pos = min(safe, key=lambda pos: (pos in self.game.flags, pos))
+        button = self.buttons[self.hint_pos]
+        button.setProperty("hint", True)
+        button.update()
+        self.scroll.ensureWidgetVisible(button)
+        self.status.setText("绿框安全，请先取消旗子" if self.hint_pos in self.game.flags else "绿框为逻辑可证的安全格")
+
     def click_cell(self, pos):
-        if self.game.finished:
+        if self.game.finished or self.generating:
             return
         if self.flag_mode.isChecked():
             self.toggle_flag(pos)
+            return
+        self.clear_hint()
+        if not self.game.started and pos not in self.game.flags:
+            self.generating = True
+            self.status.setText("正在生成无猜测棋盘…")
+            self.setCursor(Qt.CursorShape.WaitCursor)
+            self.prepare_board(self.game, pos, self.game.generate(pos))
             return
         was_started = self.game.started
         changed = self.game.reveal(pos)
@@ -357,7 +418,32 @@ class Minesweeper(QMainWindow):
             self.finish()
         elif self.game.started:
             self.status.setText("游戏中")
+            if changed and self.auto_flag_action.isChecked():
+                self.auto_flag()
         self.update_info()
+
+    def prepare_board(self, game, pos, generator):
+        # 每次只验证一个候选棋盘，期间仍可重开或切换难度。
+        if game is not self.game:
+            return
+        try:
+            next(generator)
+        except StopIteration:
+            self.generating = False
+            self.unsetCursor()
+            self.elapsed.start()
+            self.timer.start()
+            # 点击发生时的操作是翻格，不受等待期间插旗模式变化影响。
+            flag_mode = self.flag_mode.isChecked()
+            self.flag_mode.setChecked(False)
+            self.click_cell(pos)
+            self.flag_mode.setChecked(flag_mode)
+        except RuntimeError as error:
+            self.generating = False
+            self.unsetCursor()
+            self.status.setText(str(error))
+        else:
+            QTimer.singleShot(0, lambda: self.prepare_board(game, pos, generator))
 
     def finish(self):
         self.final_seconds = self.elapsed.elapsed() // 1000 if self.elapsed.isValid() else 0
